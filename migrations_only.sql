@@ -1,0 +1,1224 @@
+-- ===========================================================================
+-- pLMS — MIGRATIONS (run AFTER schema.sql)
+-- ---------------------------------------------------------------------------
+-- Use this when schema.sql has already been run. It applies every migration
+-- (0001–0056) plus the storage bucket, in order. Every statement is idempotent
+-- (IF NOT EXISTS / drop-then-add), so it is safe to run (and re-run).
+--   1. Run schema.sql first (creates the base tables).
+--   2. Then run this whole file once.
+-- ===========================================================================
+
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0001_homework_features.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- Migration 0001 — homework features
+-- ---------------------------------------------------------------------------
+-- Run this ONCE in the Supabase SQL editor on an EXISTING database (one that
+-- was already created from the original schema.sql). Fresh installs already
+-- include these columns via schema.sql. Idempotent.
+--
+-- Adds:
+--   * homework.attachment_url  — optional task file for FILE homework
+--   * quiz_questions.options   — choices for multiple-choice questions
+--                                (NULL/empty => free-text question)
+-- ===========================================================================
+
+alter table public.homework
+  add column if not exists attachment_url text;
+
+alter table public.quiz_questions
+  add column if not exists options text[];
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0002_lesson_attendance.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- Migration 0002 — lesson attendance
+-- ---------------------------------------------------------------------------
+-- Run ONCE in the Supabase SQL editor on an existing database. Idempotent.
+-- A row means the student was present at the lesson.
+-- ===========================================================================
+
+create table if not exists public.lesson_attendance (
+  lesson_id  uuid not null references public.lessons (id) on delete cascade,
+  student_id uuid not null references public.students (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (lesson_id, student_id)
+);
+
+create index if not exists lesson_attendance_lesson_id_idx on public.lesson_attendance (lesson_id);
+create index if not exists lesson_attendance_student_id_idx on public.lesson_attendance (student_id);
+
+alter table public.lesson_attendance enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0003_quiz_multiple_correct.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- Migration 0003 — multiple correct answers + per-question grading mode
+-- ---------------------------------------------------------------------------
+-- Run ONCE in the Supabase SQL editor on an existing database. Idempotent.
+--
+--   * quiz_questions.correct_answers — the set of correct options for a
+--     CHOICE question (free-text questions keep using correct_answer).
+--   * quiz_questions.grading — 'STRICT' (all-or-nothing) or 'PARTIAL'
+--     (credit per correct option, minus wrong ones). Existing rows default
+--     to 'STRICT'.
+-- ===========================================================================
+
+alter table public.quiz_questions
+  add column if not exists correct_answers text[];
+
+alter table public.quiz_questions
+  add column if not exists grading text not null default 'STRICT';
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0004_quiz_attempts.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- Migration 0004 — quiz attempt history + attempt limit
+-- ---------------------------------------------------------------------------
+-- Run ONCE in the Supabase SQL editor on an existing database. Idempotent.
+--
+--   * homework.max_attempts — limit on quiz attempts (NULL = unlimited).
+--   * quiz_attempts — full history of a student's quiz attempts.
+-- ===========================================================================
+
+alter table public.homework
+  add column if not exists max_attempts integer;
+
+create table if not exists public.quiz_attempts (
+  id          uuid primary key default gen_random_uuid(),
+  homework_id uuid not null references public.homework (id) on delete cascade,
+  student_id  uuid not null references public.students (id) on delete cascade,
+  attempt_no  integer not null,
+  answers     text,
+  score       numeric(5, 2),
+  created_at  timestamptz not null default now()
+);
+
+create index if not exists quiz_attempts_homework_student_idx
+  on public.quiz_attempts (homework_id, student_id);
+
+alter table public.quiz_attempts enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0005_multiple_files.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0005 — multiple files per homework task and per submission (up to 5)
+-- ---------------------------------------------------------------------------
+-- Adds array columns alongside the existing single-file columns. Old rows keep
+-- working: readers fall back to attachment_url / answer when the array is null.
+-- Safe to re-run.
+-- ===========================================================================
+
+-- Teacher's task files (FILE homework). Was a single attachment_url.
+alter table public.homework
+  add column if not exists attachment_urls text[];
+
+-- Student's submitted files (FILE homework). Was stored in `answer`.
+alter table public.homework_submissions
+  add column if not exists attachment_urls text[];
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0006_materials_constructor.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0006_materials_constructor
+-- Split the flat file library off from the new constructor, and add the
+-- constructor hierarchy: materials → sections → lessons → modules → items.
+-- ===========================================================================
+
+-- Split flat file library off from the new constructor.
+alter table if exists public.materials rename to files;
+
+-- New constructor container.
+create table if not exists public.materials (
+  id          uuid primary key default gen_random_uuid(),
+  title       text not null,
+  description text,
+  cover_url   text,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+create table if not exists public.material_sections (
+  id          uuid primary key default gen_random_uuid(),
+  material_id uuid not null references public.materials (id) on delete cascade,
+  title       text not null,
+  position    integer not null default 0,
+  created_at  timestamptz not null default now()
+);
+create index if not exists material_sections_material_id_idx on public.material_sections (material_id);
+
+create table if not exists public.material_lessons (
+  id          uuid primary key default gen_random_uuid(),
+  section_id  uuid not null references public.material_sections (id) on delete cascade,
+  title       text not null,
+  position    integer not null default 0,
+  created_at  timestamptz not null default now()
+);
+create index if not exists material_lessons_section_id_idx on public.material_lessons (section_id);
+
+create table if not exists public.material_modules (
+  id          uuid primary key default gen_random_uuid(),
+  lesson_id   uuid not null references public.material_lessons (id) on delete cascade,
+  title       text not null,
+  position    integer not null default 0,
+  created_at  timestamptz not null default now()
+);
+create index if not exists material_modules_lesson_id_idx on public.material_modules (lesson_id);
+
+create table if not exists public.material_items (
+  id         uuid primary key default gen_random_uuid(),
+  module_id  uuid not null references public.material_modules (id) on delete cascade,
+  position   integer not null default 0,
+  type       text not null check (type in ('INFO','CHOICE','GAPS','FREE','MATCH')),
+  content    jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists material_items_module_id_idx on public.material_items (module_id);
+
+-- RLS: enable everywhere, no policies (service_role only).
+alter table public.files             enable row level security;
+alter table public.materials         enable row level security;
+alter table public.material_sections enable row level security;
+alter table public.material_lessons  enable row level security;
+alter table public.material_modules  enable row level security;
+alter table public.material_items    enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0007_drop_modules.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0007_drop_modules
+-- Remove the "module" level. Items now attach directly to a lesson.
+-- Hierarchy becomes: material → section → lesson → items.
+-- Safe on a fresh DB (no meaningful data yet): items are recreated.
+-- ===========================================================================
+
+drop table if exists public.material_items cascade;
+drop table if exists public.material_modules cascade;
+
+create table if not exists public.material_items (
+  id         uuid primary key default gen_random_uuid(),
+  lesson_id  uuid not null references public.material_lessons (id) on delete cascade,
+  position   integer not null default 0,
+  type       text not null check (type in ('INFO','CHOICE','GAPS','FREE','MATCH')),
+  content    jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists material_items_lesson_id_idx on public.material_items (lesson_id);
+
+alter table public.material_items enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0008_restore_modules.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0008_restore_modules
+-- Reintroduce the "module" level between lesson and items.
+-- Hierarchy: material → section → lesson → module → items.
+-- Safe on the current state (constructor data is empty): items are recreated.
+-- Run AFTER 0007.
+-- ===========================================================================
+
+drop table if exists public.material_items cascade;
+
+create table if not exists public.material_modules (
+  id          uuid primary key default gen_random_uuid(),
+  lesson_id   uuid not null references public.material_lessons (id) on delete cascade,
+  title       text not null,
+  position    integer not null default 0,
+  created_at  timestamptz not null default now()
+);
+create index if not exists material_modules_lesson_id_idx on public.material_modules (lesson_id);
+
+create table if not exists public.material_items (
+  id         uuid primary key default gen_random_uuid(),
+  module_id  uuid not null references public.material_modules (id) on delete cascade,
+  position   integer not null default 0,
+  type       text not null check (type in ('INFO','CHOICE','GAPS','FREE','MATCH')),
+  content    jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists material_items_module_id_idx on public.material_items (module_id);
+
+alter table public.material_modules enable row level security;
+alter table public.material_items   enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0009_item_types_quiz_audio.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0009_item_types_quiz_audio
+-- Replace the CHOICE item type with QUIZ (multi-question test, like homework)
+-- and add AUDIO (listening: audio + questions).
+--
+-- Any pre-existing items of a now-removed type (e.g. CHOICE test data) are
+-- deleted first, otherwise the new CHECK constraint would be violated.
+-- ===========================================================================
+
+-- Drop leftover items whose type is no longer valid (old CHOICE test data).
+delete from public.material_items
+where type not in ('INFO','QUIZ','GAPS','FREE','MATCH','AUDIO');
+
+alter table public.material_items drop constraint if exists material_items_type_check;
+
+alter table public.material_items
+  add constraint material_items_type_check
+  check (type in ('INFO','QUIZ','GAPS','FREE','MATCH','AUDIO'));
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0010_item_meta_groups_pins.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0010_item_meta_groups_pins
+-- 1. Item envelope fields: optional title + note (with hide-from-student flag).
+-- 2. Material ↔ groups access (which groups can see a material).
+-- 3. Item ↔ group pins (highlight/priority an exercise for a group).
+-- ===========================================================================
+
+alter table public.material_items add column if not exists title text;
+alter table public.material_items add column if not exists note text;
+alter table public.material_items add column if not exists note_hidden boolean not null default false;
+
+-- Groups that have access to a material.
+create table if not exists public.material_groups (
+  material_id uuid not null references public.materials (id) on delete cascade,
+  group_id    uuid not null references public.groups (id) on delete cascade,
+  created_at  timestamptz not null default now(),
+  primary key (material_id, group_id)
+);
+create index if not exists material_groups_group_id_idx on public.material_groups (group_id);
+
+-- Exercises pinned / highlighted for a specific group.
+create table if not exists public.material_item_pins (
+  item_id    uuid not null references public.material_items (id) on delete cascade,
+  group_id   uuid not null references public.groups (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (item_id, group_id)
+);
+create index if not exists material_item_pins_group_id_idx on public.material_item_pins (group_id);
+
+alter table public.material_groups     enable row level security;
+alter table public.material_item_pins  enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0011_media_item_types.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0011_media_item_types
+-- Add media item formats: VIDEO (embed by URL), IMAGE, CAROUSEL, LINK.
+-- (AUDIO becomes questionless — a content-shape change only, no enum change.)
+-- ===========================================================================
+
+alter table public.material_items drop constraint if exists material_items_type_check;
+
+alter table public.material_items
+  add constraint material_items_type_check
+  check (type in ('INFO','QUIZ','GAPS','FREE','MATCH','AUDIO','VIDEO','IMAGE','CAROUSEL','LINK'));
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0012_image_task_item_type.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0012_image_task_item_type
+-- Add IMAGE_TASK: image-based exercises (drag image↔word, type/select word for
+-- image, select correct images). Variant is stored inside the JSON content.
+-- ===========================================================================
+
+alter table public.material_items drop constraint if exists material_items_type_check;
+
+alter table public.material_items
+  add constraint material_items_type_check
+  check (type in ('INFO','QUIZ','GAPS','FREE','MATCH','AUDIO','VIDEO','IMAGE','CAROUSEL','LINK','IMAGE_TASK'));
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0013_sentence_task_item_type.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0013_sentence_task_item_type
+-- Add SENTENCE_TASK: sentence work (word order, sort into columns, sentence
+-- order, build word from letters, match pairs). The old MATCH type stays in the
+-- enum for backward compatibility but is no longer offered as a standalone
+-- format — "match pairs" becomes a SENTENCE_TASK variant.
+-- ===========================================================================
+
+alter table public.material_items drop constraint if exists material_items_type_check;
+
+alter table public.material_items
+  add constraint material_items_type_check
+  check (type in ('INFO','QUIZ','GAPS','FREE','MATCH','AUDIO','VIDEO','IMAGE','CAROUSEL','LINK','IMAGE_TASK','SENTENCE_TASK'));
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0014_item_submissions.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0014_item_submissions
+-- Student answers + scores for material exercises (the player's persistence).
+-- ===========================================================================
+
+create table if not exists public.material_item_submissions (
+  id           uuid primary key default gen_random_uuid(),
+  student_id   uuid not null references public.students (id) on delete cascade,
+  item_id      uuid not null references public.material_items (id) on delete cascade,
+  answer       jsonb not null default '{}'::jsonb,
+  score        numeric(5, 2),
+  submitted_at timestamptz not null default now(),
+  unique (student_id, item_id)
+);
+
+create index if not exists material_item_submissions_student_id_idx on public.material_item_submissions (student_id);
+create index if not exists material_item_submissions_item_id_idx on public.material_item_submissions (item_id);
+
+alter table public.material_item_submissions enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0015_submission_reaction.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0015_submission_reaction
+-- Teacher reaction (emoji) on a student's exercise submission.
+-- ===========================================================================
+
+alter table public.material_item_submissions add column if not exists reaction text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0016_dictionary.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0016_dictionary
+-- Shared dictionary of terms (word → translation, optional pinyin/note).
+-- ===========================================================================
+
+create table if not exists public.dictionary_entries (
+  id          uuid primary key default gen_random_uuid(),
+  term        text not null,
+  translation text not null,
+  pinyin      text,
+  note        text,
+  created_at  timestamptz not null default now()
+);
+create index if not exists dictionary_entries_term_idx on public.dictionary_entries (term);
+
+alter table public.dictionary_entries enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0017_dictionary_owner.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0017_dictionary_owner
+-- Make the dictionary per-user (each user has their own words).
+-- Existing shared rows (owner NULL) are removed.
+-- ===========================================================================
+
+alter table public.dictionary_entries add column if not exists owner_id uuid references public.users (id) on delete cascade;
+
+delete from public.dictionary_entries where owner_id is null;
+
+create index if not exists dictionary_entries_owner_idx on public.dictionary_entries (owner_id);
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0018_item_retry.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0018_item_retry
+-- Let the tutor forbid re-taking an exercise. When false (default), a student
+-- may press "Пройти заново" to clear their submission and answer again.
+-- ===========================================================================
+
+alter table public.material_items add column if not exists retry_disabled boolean not null default false;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0019_item_text_style.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0019_item_text_style
+-- Per-exercise text styling that persists and is shown to students.
+-- NULL means "inherit the default".
+-- ===========================================================================
+
+alter table public.material_items add column if not exists font_family text;
+alter table public.material_items add column if not exists font_size text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0020_lesson_background.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0020_lesson_background
+-- Optional decorative background per lesson, shown behind the module menu and
+-- the exercise blocks. background_dim is a 0..80 percentage of a black overlay
+-- used to lower the background brightness. NULL url = no background.
+-- ===========================================================================
+
+alter table public.material_lessons add column if not exists background_url text;
+alter table public.material_lessons add column if not exists background_dim integer not null default 0;
+
+-- Example: give the demo "Предложения" lesson a background out of the box.
+update public.material_lessons
+set background_url = '/backgrounds/sentences.svg', background_dim = 25
+where title = 'Предложения' and background_url is null;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0021_item_explanation.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0021_item_explanation
+-- Optional explanation shown to the student after a wrong answer (score < 100).
+-- ===========================================================================
+
+alter table public.material_items add column if not exists explanation text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0022_item_drawing.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0022_item_drawing
+-- Saved freehand annotation drawn by the tutor over the student view of an
+-- exercise (PNG data URL). Shown as an overlay to students.
+-- ===========================================================================
+
+alter table public.material_items add column if not exists drawing text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0023_live_sessions.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0023_live_sessions
+-- Live tutoring sessions: a tutor drives a group through a material in real
+-- time — switching everyone to an exercise, drawing over it, and watching
+-- results. One active (ended_at is null) session per group at a time.
+-- ===========================================================================
+
+create table if not exists public.live_sessions (
+  id uuid primary key default gen_random_uuid(),
+  group_id uuid not null references public.groups (id) on delete cascade,
+  material_id uuid not null references public.materials (id) on delete cascade,
+  active_item_id uuid references public.material_items (id) on delete set null,
+  drawing text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  ended_at timestamptz
+);
+
+create unique index if not exists live_sessions_one_active_per_group
+  on public.live_sessions (group_id)
+  where ended_at is null;
+
+-- RLS on, no policies = deny-all for anon/authenticated keys. The app uses the
+-- service-role key (which bypasses RLS), matching every other table here.
+alter table public.live_sessions enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0024_session_scope.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0024_session_scope
+-- Let a live session broadcast a whole section / lesson / module (all its
+-- exercises), not just a single item. active_kind says what active_node_id
+-- points at; for 'item' the existing active_item_id is used instead.
+-- ===========================================================================
+
+alter table public.live_sessions add column if not exists active_kind text not null default 'item';
+alter table public.live_sessions add column if not exists active_node_id uuid;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0025_live_drawings.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0025_live_drawings
+-- (1) focused_item_id: the exercise the tutor "pinned" — students scroll to it
+--     while still seeing the whole lesson.
+-- (2)/(3) live_drawings: per-exercise drawings by the tutor and by each student,
+--     so the tutor's strokes show to students live and the tutor can watch a
+--     student's strokes. author_key = 'tutor' or the student's id.
+-- ===========================================================================
+
+alter table public.live_sessions add column if not exists focused_item_id uuid references public.material_items (id) on delete set null;
+
+create table if not exists public.live_drawings (
+  session_id uuid not null references public.live_sessions (id) on delete cascade,
+  item_id uuid not null references public.material_items (id) on delete cascade,
+  author_key text not null,
+  student_id uuid references public.students (id) on delete cascade,
+  drawing text,
+  updated_at timestamptz not null default now(),
+  primary key (session_id, item_id, author_key)
+);
+
+alter table public.live_drawings enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0026_lesson_background_fit.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0026_lesson_background_fit
+-- How the lesson background is displayed: fit (cover / contain / tile),
+-- vertical position, and a scale (%) used for the tile mode — so the picture
+-- doesn't get stretched or misaligned.
+-- ===========================================================================
+
+alter table public.material_lessons add column if not exists background_fit text not null default 'cover';
+alter table public.material_lessons add column if not exists background_position text not null default 'center';
+alter table public.material_lessons add column if not exists background_scale integer not null default 100;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0027_assistants.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0027_assistants
+-- Assistant teachers: a restricted staff role. They can see only the groups and
+-- materials the main tutor assigns them, run live sessions, and edit a material
+-- only when granted (assistant_materials.can_edit).
+-- ===========================================================================
+
+alter table public.users drop constraint if exists users_role_check;
+alter table public.users add constraint users_role_check check (role in ('TUTOR', 'STUDENT', 'ASSISTANT'));
+
+create table if not exists public.assistant_groups (
+  assistant_id uuid not null references public.users (id) on delete cascade,
+  group_id uuid not null references public.groups (id) on delete cascade,
+  primary key (assistant_id, group_id)
+);
+
+create table if not exists public.assistant_materials (
+  assistant_id uuid not null references public.users (id) on delete cascade,
+  material_id uuid not null references public.materials (id) on delete cascade,
+  can_edit boolean not null default false,
+  primary key (assistant_id, material_id)
+);
+
+alter table public.assistant_groups enable row level security;
+alter table public.assistant_materials enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0028_messages.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0028_messages
+-- Simple 1-to-1 messenger between the tutor and each assistant.
+-- ===========================================================================
+
+create table if not exists public.messages (
+  id           uuid primary key default gen_random_uuid(),
+  sender_id    uuid not null references public.users (id) on delete cascade,
+  recipient_id uuid not null references public.users (id) on delete cascade,
+  body         text not null,
+  created_at   timestamptz not null default now(),
+  read_at      timestamptz
+);
+
+create index if not exists messages_pair_idx on public.messages (sender_id, recipient_id, created_at);
+create index if not exists messages_recipient_idx on public.messages (recipient_id, read_at);
+
+alter table public.messages enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0029_session_history.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0029_session_history
+-- Live-session history: who hosted a session and which students attended.
+-- Sessions are pruned after 2 months (done opportunistically in app code when
+-- the history is loaded; a pg_cron job may be added instead if preferred).
+-- ===========================================================================
+
+alter table public.live_sessions add column if not exists host_id uuid references public.users (id) on delete set null;
+
+create table if not exists public.live_session_attendance (
+  session_id uuid not null references public.live_sessions (id) on delete cascade,
+  student_id uuid not null references public.students (id) on delete cascade,
+  first_seen timestamptz not null default now(),
+  primary key (session_id, student_id)
+);
+
+create index if not exists live_sessions_ended_idx on public.live_sessions (ended_at);
+
+alter table public.live_session_attendance enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0030_free_answer_edits.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0030_free_answer_edits
+-- Tutor/assistant corrections to a student's free-text answer. The student can
+-- toggle between the original ("до изменений") and this edited version.
+-- ===========================================================================
+
+alter table public.material_item_submissions add column if not exists edited_answer text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0031_message_attachments.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0031_message_attachments
+-- Optional single file attachment on a chat message.
+-- ===========================================================================
+
+alter table public.messages add column if not exists attachment_url text;
+alter table public.messages add column if not exists attachment_name text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0032_session_lesson_link.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0032_session_lesson_link
+-- Link a live session to the scheduled calendar lesson it was run for, so the
+-- history can show planned lessons as conducted / not conducted / cancelled and
+-- ad-hoc sessions as unplanned.
+-- ===========================================================================
+
+alter table public.live_sessions add column if not exists lesson_id uuid references public.lessons (id) on delete set null;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0033_item_vocab.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0033_item_vocab
+-- Optional "new words" list attached to an exercise: [{term, translation}, …].
+-- Shown to the student in a green panel beside the exercise.
+-- ===========================================================================
+
+alter table public.material_items add column if not exists vocab jsonb;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0034_cards_item_type.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0034_cards_item_type
+-- Allow the new CARDS ("Случайные карточки") exercise type.
+-- ===========================================================================
+
+alter table public.material_items drop constraint if exists material_items_type_check;
+alter table public.material_items
+  add constraint material_items_type_check
+  check (type in ('INFO','QUIZ','GAPS','FREE','MATCH','AUDIO','VIDEO','IMAGE','CAROUSEL','LINK','IMAGE_TASK','SENTENCE_TASK','CARDS'));
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0035_item_numbering.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0035_item_numbering
+-- Per-item flag to drop it from the automatic "module.exercise" numbering.
+-- When true, the item keeps no number and the sequence continues on the next.
+-- ===========================================================================
+
+alter table public.material_items add column if not exists unnumbered boolean not null default false;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0036_assistant_profile.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0036_assistant_profile
+-- Assistants (users with role ASSISTANT) gain a profile like students:
+-- a full name, free-form notes, and an archive flag.
+-- ===========================================================================
+
+alter table public.users add column if not exists full_name  text;
+alter table public.users add column if not exists notes       text;
+alter table public.users add column if not exists is_archived boolean not null default false;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0036_live_session_hands.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0036_live_session_hands
+-- "Raise hand" during a live session: a student flags for the tutor's
+-- attention; the row is removed when the hand is lowered or acknowledged.
+-- ===========================================================================
+
+create table if not exists public.live_session_hands (
+  session_id uuid not null references public.live_sessions (id) on delete cascade,
+  student_id uuid not null references public.students (id) on delete cascade,
+  raised_at  timestamptz not null default now(),
+  primary key (session_id, student_id)
+);
+
+alter table public.live_session_hands enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0037_group_messages.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0037_group_messages
+-- Group chats: one shared thread per group. Participants are the group's
+-- students, assistants with access to the group, and the tutor.
+-- ===========================================================================
+
+create table if not exists public.group_messages (
+  id              uuid primary key default gen_random_uuid(),
+  group_id        uuid not null references public.groups (id) on delete cascade,
+  sender_id       uuid not null references public.users (id) on delete cascade,
+  body            text,
+  attachment_url  text,
+  attachment_name text,
+  created_at      timestamptz not null default now()
+);
+
+create index if not exists group_messages_group_id_idx on public.group_messages (group_id, created_at);
+
+alter table public.group_messages enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0038_administrator_role.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0038_administrator_role
+-- New user role ADMINISTRATOR: oversight + limited management (grants access,
+-- adds students to groups) but cannot edit materials.
+-- ===========================================================================
+
+alter table public.users drop constraint if exists users_role_check;
+alter table public.users
+  add constraint users_role_check
+  check (role in ('TUTOR', 'STUDENT', 'ASSISTANT', 'ADMINISTRATOR'));
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0039_lesson_series.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0039_lesson_series
+-- Groups lessons created together as a recurring series so the whole series
+-- can be managed (deleted) at once. NULL = a one-off lesson.
+-- ===========================================================================
+
+alter table public.lessons add column if not exists series_id uuid;
+create index if not exists lessons_series_id_idx on public.lessons (series_id);
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0040_settings_keyboards.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0040_settings_keyboards
+-- Which optional "extra keyboards" (symbol palettes) are enabled org-wide.
+-- Defaults to IPA so the existing helper stays available.
+-- ===========================================================================
+
+alter table public.settings add column if not exists enabled_keyboards jsonb not null default '["ipa"]'::jsonb;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0041_payment_requests.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0041_payment_requests
+-- Students submit a payment mark (amount + number of lessons) that a tutor or
+-- administrator confirms or rejects. Existing rows stay CONFIRMED.
+-- ===========================================================================
+
+alter table public.payments add column if not exists lessons integer;
+alter table public.payments add column if not exists status text not null default 'CONFIRMED';
+alter table public.payments drop constraint if exists payments_status_check;
+alter table public.payments
+  add constraint payments_status_check check (status in ('PENDING', 'CONFIRMED', 'REJECTED'));
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0042_lesson_adjustments.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0042_lesson_adjustments
+-- Manual corrections to a student's lesson balance. A student's remaining
+-- lessons = paid lessons (confirmed payments) + sum(adjustments.delta) − lessons
+-- consumed (past, non-cancelled lessons of the student's groups). A tutor uses a
+-- positive delta to credit a lesson back (e.g. a lesson that shouldn't count) or
+-- a negative delta to debit one.
+-- ===========================================================================
+
+create table if not exists public.lesson_adjustments (
+  id         uuid primary key default gen_random_uuid(),
+  student_id uuid not null references public.students (id) on delete cascade,
+  delta      integer not null,
+  comment    text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists lesson_adjustments_student_id_idx on public.lesson_adjustments (student_id);
+
+alter table public.lesson_adjustments enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0043_material_language.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0043_material_language
+-- Each material has an optional "study language", chosen on the material page
+-- from the list of languages configured in Settings (settings.languages).
+-- ===========================================================================
+
+alter table public.materials add column if not exists language text;
+
+alter table public.settings add column if not exists languages jsonb not null default '[]'::jsonb;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0044_dictionary_language.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0044_dictionary_language
+-- Dictionaries are split per study language. Each entry carries the language it
+-- belongs to (null = the legacy "Общий" dictionary). A user's set of dictionaries
+-- is derived at read time (staff: all settings.languages; student: languages of
+-- accessible materials plus any language they already have entries in — so a
+-- dictionary is never lost when material access ends).
+-- ===========================================================================
+
+alter table public.dictionary_entries add column if not exists language text;
+
+create index if not exists dictionary_entries_owner_lang_idx
+  on public.dictionary_entries (owner_id, language);
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0045_grammar_reference.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0045_grammar_reference
+-- A shared grammar reference: an ordered set of text blocks (title + body) that
+-- everyone can browse as a carousel with search. Managed by tutors/administrators.
+-- ===========================================================================
+
+create table if not exists public.grammar_entries (
+  id         uuid primary key default gen_random_uuid(),
+  title      text not null,
+  body       text not null default '',
+  position   integer not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists grammar_entries_position_idx on public.grammar_entries (position, created_at);
+
+alter table public.grammar_entries enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0046_homework_section.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0046_homework_section
+-- Every material has a "Домашние задания" section: created automatically with
+-- the material, always pinned last, and protected from move/rename/delete.
+-- Marked by material_sections.is_homework.
+-- ===========================================================================
+
+alter table public.material_sections
+  add column if not exists is_homework boolean not null default false;
+
+-- Backfill: give every material that lacks one a homework section at the end.
+insert into public.material_sections (material_id, title, position, is_homework)
+select
+  m.id,
+  'Домашние задания',
+  coalesce((select max(s.position) + 1 from public.material_sections s where s.material_id = m.id), 0),
+  true
+from public.materials m
+where not exists (
+  select 1 from public.material_sections s
+  where s.material_id = m.id and s.is_homework = true
+);
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0047_lesson_access.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0047_lesson_access
+-- Per-group access rules for individual lessons. One row per (group, lesson);
+-- absence of a row means OPEN (accessible by default).
+--   mode = OPEN      -> always accessible
+--   mode = DATE      -> accessible once now() >= available_at
+--   mode = PROGRESS  -> accessible once the previous lesson is fully submitted
+--   mode = MANUAL    -> accessible only when unlocked = true (tutor opens it)
+-- ===========================================================================
+
+create table if not exists public.lesson_access (
+  id           uuid primary key default gen_random_uuid(),
+  group_id     uuid not null references public.groups(id) on delete cascade,
+  lesson_id    uuid not null references public.material_lessons(id) on delete cascade,
+  mode         text not null default 'OPEN' check (mode in ('OPEN', 'DATE', 'PROGRESS', 'MANUAL')),
+  available_at timestamptz,
+  unlocked     boolean not null default false,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  unique (group_id, lesson_id)
+);
+
+create index if not exists lesson_access_group_idx on public.lesson_access (group_id);
+create index if not exists lesson_access_lesson_idx on public.lesson_access (lesson_id);
+
+alter table public.lesson_access enable row level security;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0048_homework_module.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0048_homework_module
+-- Homework moves from a material-level section to a per-lesson module: every
+-- lesson gets a "Домашние задания" module, created automatically, always last,
+-- unnumbered, protected from move/rename/delete. Retires the homework SECTION
+-- introduced in 0046.
+-- ===========================================================================
+
+alter table public.material_modules
+  add column if not exists is_homework boolean not null default false;
+
+-- Backfill: a homework module at the end of every lesson that lacks one.
+insert into public.material_modules (lesson_id, title, position, is_homework)
+select
+  l.id,
+  'Домашние задания',
+  coalesce((select max(m.position) + 1 from public.material_modules m where m.lesson_id = l.id), 0),
+  true
+from public.material_lessons l
+where not exists (
+  select 1 from public.material_modules m
+  where m.lesson_id = l.id and m.is_homework = true
+);
+
+-- Retire the old homework SECTION concept (auto-created, normally empty). This
+-- cascades to any lessons/modules/items under it.
+delete from public.material_sections where is_homework = true;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0049_assistant_create_materials.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0049_assistant_create_materials
+-- Permission (tutor-controlled, in Settings) for whether assistants may create
+-- their own materials. Off by default.
+-- ===========================================================================
+
+alter table public.settings
+  add column if not exists assistants_can_create_materials boolean not null default false;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0050_assistant_create_materials_per_user.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0050_assistant_create_materials_per_user
+-- Per-assistant permission to create materials (managed on the Assistants tab),
+-- replacing the global Settings flag from 0049. Off by default.
+-- ===========================================================================
+
+alter table public.users
+  add column if not exists can_create_materials boolean not null default false;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0051_item_note_color.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0051_item_note_color
+-- Per-exercise note background colour (any CSS colour, chosen with a picker).
+-- Null = the default styling.
+-- ===========================================================================
+
+alter table public.material_items
+  add column if not exists note_color text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0052_item_ungraded.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0052_item_ungraded
+-- Per-exercise "ungraded" flag: when set, a submission is always scored 100
+-- (green reaction + positive sound), regardless of the answer.
+-- ===========================================================================
+
+alter table public.material_items
+  add column if not exists ungraded boolean not null default false;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0053_grammar_language.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0053_grammar_language
+-- Language for grammar entries, so the reference is scoped per language like the
+-- dictionary. Null = «Общий» (shown in every language tab).
+-- ===========================================================================
+
+alter table public.grammar_entries
+  add column if not exists language text;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0054_assistant_create_grammar.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0054_assistant_create_grammar
+-- Per-assistant permission to create/edit the grammar reference (managed on the
+-- Assistants tab, like can_create_materials). Off by default.
+-- ===========================================================================
+
+alter table public.users
+  add column if not exists can_create_grammar boolean not null default false;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0055_lesson_background_opacity.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0055_lesson_background_opacity
+-- Per-lesson transparency of the navigation menu panel and the exercise blocks
+-- so a lesson background shows through them. Stored as 0..100 % OPACITY
+-- (100 = fully solid, the default = current look; lower = more transparent).
+-- The inner exercise "stage" stays white regardless of these values.
+-- ===========================================================================
+
+alter table public.material_lessons add column if not exists background_nav_opacity integer not null default 100;
+alter table public.material_lessons add column if not exists background_block_opacity integer not null default 100;
+
+
+-- ###########################################################################
+-- ## MIGRATION: 0056_file_groups.sql
+-- ###########################################################################
+
+-- ===========================================================================
+-- 0056_file_groups
+-- Per-group access for the shared file library. A file is visible to a student
+-- only if they belong to a group linked here; staff (tutor/assistant/admin)
+-- see all files. A file with no links is staff-only.
+-- ===========================================================================
+
+create table if not exists public.file_groups (
+  file_id  uuid not null references public.files (id) on delete cascade,
+  group_id uuid not null references public.groups (id) on delete cascade,
+  primary key (file_id, group_id)
+);
+create index if not exists file_groups_group_id_idx on public.file_groups (group_id);
+
+alter table public.file_groups enable row level security;
+
+
+-- ###########################################################################
+-- ## STORAGE SETUP (storage.sql)
+-- ###########################################################################
+
+-- ===========================================================================
+-- pLMS — Supabase Storage setup
+-- ---------------------------------------------------------------------------
+-- Creates a public bucket for materials and homework files. Uploads are
+-- performed server-side with the service-role key (which bypasses storage
+-- RLS), so no additional storage policies are required. Files are served via
+-- public URLs.
+--
+-- The bucket name MUST match SUPABASE_STORAGE_BUCKET in your .env.local
+-- (default: "plms"). Change the literal below if you use a different name.
+--
+-- Run this in the Supabase SQL editor after schema.sql. Idempotent.
+-- ===========================================================================
+
+insert into storage.buckets (id, name, public)
+values ('plms', 'plms', true)
+on conflict (id) do update set public = excluded.public;
